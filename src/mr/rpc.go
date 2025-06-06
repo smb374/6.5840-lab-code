@@ -23,7 +23,27 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+type WorkerJoinArgs struct{}
+type WorkerJoinReply struct {
+	ID     int
+	Splits int
+	IsFull bool
+}
 
+type GetMapTaskArgs struct {
+	ID int
+}
+type GetMapTaskReply struct {
+	FileName    string
+	HasTaskLeft bool
+}
+
+type PostMapTaskArgs struct {
+	ID int
+}
+type PostMapTaskReply struct {
+	HasTaskLeft bool
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
