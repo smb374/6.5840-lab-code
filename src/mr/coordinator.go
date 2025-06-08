@@ -47,6 +47,9 @@ type Coordinator struct {
 	Lock      sync.Mutex
 	MapCtx    context.Context
 	ReduceCtx context.Context
+
+	// StartTime for logging runtime
+	// StartTime time.Time
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -101,6 +104,8 @@ func (c *Coordinator) WatchDog(mcancel context.CancelFunc, rcancel context.Cance
 			if finished == c.Reduces {
 				c.Finished = true
 				rcancel()
+				// now := time.Now()
+				// log.Printf("MapReduce finished, took %v", now.Sub(c.StartTime))
 			}
 		} else {
 			finished := 0
@@ -326,6 +331,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		}
 	}
 
+	// c.StartTime = time.Now()
 	c.server()
 	go c.WatchDog(mcancel, rcancel)
 	return &c
