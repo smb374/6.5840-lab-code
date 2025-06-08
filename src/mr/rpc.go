@@ -30,19 +30,42 @@ type WorkerJoinReply struct {
 	IsFull bool
 }
 
-type GetMapTaskArgs struct {
+type WorkerReduceReadyArgs struct{}
+type WorkerReduceReadyReply struct {
+	Mappers int
+}
+
+type WorkerLeaveArgs struct {
 	ID int
 }
+type WorkerLeaveReply struct{}
+
+type GetMapTaskArgs struct{}
 type GetMapTaskReply struct {
+	ID          int
 	FileName    string
 	HasTaskLeft bool
 }
 
 type PostMapTaskArgs struct {
-	ID int
+	ID       int
+	FileName string
 }
 type PostMapTaskReply struct {
 	HasTaskLeft bool
+}
+
+type GetReduceSplitArgs struct{}
+type GetReduceSplitReply struct {
+	Split        int
+	HasSplitLeft bool
+}
+
+type PostReduceSplitArgs struct {
+	Split int
+}
+type PostReduceSplitReply struct {
+	HasSplitLeft bool
 }
 
 // Cook up a unique-ish UNIX-domain socket name

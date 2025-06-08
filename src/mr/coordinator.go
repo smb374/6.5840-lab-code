@@ -12,12 +12,13 @@ import (
 
 type Coordinator struct {
 	// Your definitions here.
-	Files   []string
-	TaskIdx int
-	Workers int
-	Splits  int
-	Mapped  int
-	Lock    sync.Mutex
+	Files      []string
+	FileMapped []bool
+	TaskIdx    int
+	Workers    int
+	Splits     int
+	Mapped     int
+	Lock       sync.Mutex
 }
 
 // Your code here -- RPC handlers for the worker to call.
