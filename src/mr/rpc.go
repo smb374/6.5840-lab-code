@@ -27,12 +27,12 @@ type WorkerJoinArgs struct{}
 type WorkerJoinReply struct {
 	ID     int
 	Splits int
-	IsFull bool
 }
 
 type WorkerReduceReadyArgs struct{}
 type WorkerReduceReadyReply struct {
-	Mappers int
+	Mappers    int
+	HasResched bool
 }
 
 type WorkerLeaveArgs struct {
@@ -40,7 +40,9 @@ type WorkerLeaveArgs struct {
 }
 type WorkerLeaveReply struct{}
 
-type GetMapTaskArgs struct{}
+type GetMapTaskArgs struct {
+	ID int
+}
 type GetMapTaskReply struct {
 	ID          int
 	FileName    string
@@ -48,25 +50,24 @@ type GetMapTaskReply struct {
 }
 
 type PostMapTaskArgs struct {
-	ID       int
-	FileName string
+	ID    int
+	MapID int
 }
-type PostMapTaskReply struct {
+type PostMapTaskReply struct{}
+
+type GetReduceTaskArgs struct {
+	ID int
+}
+type GetReduceTaskReply struct {
+	Split       int
 	HasTaskLeft bool
 }
 
-type GetReduceSplitArgs struct{}
-type GetReduceSplitReply struct {
-	Split        int
-	HasSplitLeft bool
+type PostReduceTaskArgs struct {
+	ID       int
+	ReduceID int
 }
-
-type PostReduceSplitArgs struct {
-	Split int
-}
-type PostReduceSplitReply struct {
-	HasSplitLeft bool
-}
+type PostReduceTaskReply struct{}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.

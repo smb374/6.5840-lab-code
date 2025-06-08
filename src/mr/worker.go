@@ -45,7 +45,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 
 	// Worker join to system
 	wparam, ok := CallWorkerJoin()
-	if !ok || wparam.IsFull {
+	if !ok {
 		return
 	}
 	// Worker Leave on return
@@ -54,7 +54,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 	// Map phase
 	for {
 		// Get map task
-		task, ok := CallGetMapTask()
+		task, ok := CallGetMapTask(wparam.ID)
 		if !ok || !task.HasTaskLeft {
 			break
 		}
@@ -94,8 +94,8 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 		}
 
 		// Post Task Finished Message
-		pr, ok := CallPostMapTask(task.ID, task.FileName)
-		if !ok || !pr.HasTaskLeft {
+		_, ok = CallPostMapTask(wparam.ID, task.ID)
+		if !ok {
 			break
 		}
 	}
@@ -171,8 +171,8 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 		ofile.Close()
 
 		// Post Split process done
-		rep, ok := CallPostReduceSplit(rparam.Split)
-		if !ok || !rep.HasSplitLeft {
+		_, ok = CallPostReduceSplit(wparam.ID, rparam.Split)
+		if !ok {
 			break
 		}
 	}
@@ -226,34 +226,38 @@ func CallWorkerLeave(id int) (ok bool) {
 	return
 }
 
-func CallGetMapTask() (rep GetMapTaskReply, ok bool) {
-	args := GetMapTaskArgs{}
+func CallGetMapTask(id int) (rep GetMapTaskReply, ok bool) {
+	args := GetMapTaskArgs{
+		ID: id,
+	}
+
 	ok = call("Coordinator.GetMapTask", &args, &rep)
 	return
 }
 
-func CallPostMapTask(id int, file_name string) (rep PostMapTaskReply, ok bool) {
+func CallPostMapTask(id int, mid int) (rep PostMapTaskReply, ok bool) {
 	args := PostMapTaskArgs{
-		ID:       id,
-		FileName: file_name,
+		ID:    id,
+		MapID: mid,
 	}
 
 	ok = call("Coordinator.PostMapTask", &args, &rep)
 	return
 }
 
-func CallGetReduceSplit() (rep GetReduceSplitReply, ok bool) {
-	args := GetReduceSplitArgs{}
-	ok = call("Coordinator.GetReduceSplit", &args, &rep)
+func CallGetReduceTask() (rep GetReduceTaskReply, ok bool) {
+	args := GetReduceTaskArgs{}
+	ok = call("Coordinator.GetReduceTask", &args, &rep)
 	return
 }
 
-func CallPostReduceSplit(split int) (rep PostReduceSplitReply, ok bool) {
-	args := PostReduceSplitArgs{
-		Split: split,
+func CallPostReduceTask(id int, rid int) (rep PostReduceTaskReply, ok bool) {
+	args := PostReduceTaskArgs{
+		ID:       id,
+		ReduceID: rid,
 	}
 
-	ok = call("Coordinator.PostReduceSplit", &args, &rep)
+	ok = call("Coordinator.PostReduceTask", &args, &rep)
 	return
 }
 
