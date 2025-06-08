@@ -27,7 +27,6 @@ type WorkerJoinArgs struct{}
 type WorkerJoinReply struct {
 	ID     int
 	Splits int
-	TmpDir string
 }
 
 type WorkerReduceReadyArgs struct{}

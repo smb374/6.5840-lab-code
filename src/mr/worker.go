@@ -76,7 +76,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 
 			if _, ok := intermediate[idx]; !ok {
 				// Open file & create encoder
-				fpath := fmt.Sprintf("%s/mr-%v-%v", wparam.TmpDir, task.ID, idx)
+				fpath := fmt.Sprintf("./mr-%v-%v", task.ID, idx)
 				file, err := os.OpenFile(fpath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 				if err != nil {
 					log.Fatalf("Failed to open intermediate file: %v", err)
@@ -110,7 +110,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 
 	// Read assigned splits from the coordinator
 	for {
-		rparam, ok := CallGetReduceTask()
+		rparam, ok := CallGetReduceTask(wparam.ID)
 		if !ok || !rparam.HasTaskLeft {
 			break
 		}
@@ -121,7 +121,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 		kvs := []KeyValue{}
 		for i := range ready.Mappers {
 			// Read intermediate file
-			fname := fmt.Sprintf("%s/mr-%v-%v", wparam.TmpDir, i, rparam.Split)
+			fname := fmt.Sprintf("./mr-%v-%v", i, rparam.Split)
 			file, err := os.Open(fname)
 			if err != nil {
 				if os.IsNotExist(err) {
@@ -245,8 +245,10 @@ func CallPostMapTask(id int, mid int) (rep PostMapTaskReply, ok bool) {
 	return
 }
 
-func CallGetReduceTask() (rep GetReduceTaskReply, ok bool) {
-	args := GetReduceTaskArgs{}
+func CallGetReduceTask(id int) (rep GetReduceTaskReply, ok bool) {
+	args := GetReduceTaskArgs{
+		ID: id,
+	}
 	ok = call("Coordinator.GetReduceTask", &args, &rep)
 	return
 }
