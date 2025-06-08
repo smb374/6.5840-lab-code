@@ -38,6 +38,7 @@ type Coordinator struct {
 	Finished     bool     // Are all splits reduced?
 	MapTasks     []Task   // Map Tasks
 	ReduceTasks  []Task   // Reduce Tasks
+	TmpDir       string
 
 	// Task queues feeding Get* RPC calls
 	MapQueue    chan int
@@ -139,6 +140,7 @@ func (c *Coordinator) WorkerJoin(args *WorkerJoinArgs, reply *WorkerJoinReply) e
 
 	reply.ID = c.Workers
 	reply.Splits = c.Reduces
+	reply.TmpDir = c.TmpDir
 
 	c.Workers += 1
 
@@ -299,6 +301,12 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	rctx, rcancel := context.WithCancel(context.Background())
 	c.MapCtx = mctx
 	c.ReduceCtx = rctx
+	tmp, err := os.MkdirTemp("", "mr-tmp")
+	if err != nil {
+		tmp = "."
+		log.Printf("Failed to create tmp dir for intermediate files: %v", err)
+	}
+	c.TmpDir = tmp
 
 	c.MapTasks = make([]Task, c.Maps)
 	c.ReduceTasks = make([]Task, c.Reduces)

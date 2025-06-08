@@ -76,7 +76,8 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 
 			if _, ok := intermediate[idx]; !ok {
 				// Open file & create encoder
-				file, err := os.OpenFile(fmt.Sprintf("mr-%v-%v", task.ID, idx), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+				fpath := fmt.Sprintf("%s/mr-%v-%v", wparam.TmpDir, task.ID, idx)
+				file, err := os.OpenFile(fpath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 				if err != nil {
 					log.Fatalf("Failed to open intermediate file: %v", err)
 				}
@@ -109,8 +110,8 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 
 	// Read assigned splits from the coordinator
 	for {
-		rparam, ok := CallGetReduceSplit()
-		if !ok || !rparam.HasSplitLeft {
+		rparam, ok := CallGetReduceTask()
+		if !ok || !rparam.HasTaskLeft {
 			break
 		}
 		oname := fmt.Sprintf("mr-out-%v", rparam.Split)
@@ -119,8 +120,8 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 		// Read whole split into kvs
 		kvs := []KeyValue{}
 		for i := range ready.Mappers {
-
-			fname := fmt.Sprintf("mr-%v-%v", i, rparam.Split)
+			// Read intermediate file
+			fname := fmt.Sprintf("%s/mr-%v-%v", wparam.TmpDir, i, rparam.Split)
 			file, err := os.Open(fname)
 			if err != nil {
 				if os.IsNotExist(err) {
@@ -128,7 +129,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 				}
 				log.Fatalf("Failed to open intermediate file: %v", err)
 			}
-
+			// Decode JSON lines to KeyValue
 			dec := json.NewDecoder(file)
 			for {
 				var kv KeyValue
@@ -144,7 +145,6 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 			}
 
 			file.Close()
-
 		}
 
 		// Sort & Reduce to the output file
@@ -171,7 +171,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 		ofile.Close()
 
 		// Post Split process done
-		_, ok = CallPostReduceSplit(wparam.ID, rparam.Split)
+		_, ok = CallPostReduceTask(wparam.ID, rparam.Split)
 		if !ok {
 			break
 		}
