@@ -18,7 +18,7 @@ const (
 	MAPPED   TaskState = 1
 	FINISHED TaskState = 2
 )
-const TIME_LIMIT time.Duration = time.Minute
+const TIME_LIMIT time.Duration = 10 * time.Second
 
 type Task struct {
 	ID        int       // Task ID used in queue
