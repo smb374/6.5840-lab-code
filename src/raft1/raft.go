@@ -66,9 +66,9 @@ type Raft struct {
 	ElectionCanceler context.CancelFunc
 	LeaderID         int
 	// Leader specific states
-	NextIndex  []int
-	MatchIndex []int
-	PeerCond   *sync.Cond
+	NextIndex    []int
+	MatchIndex   []int
+	BeatCanceler context.CancelFunc
 	// ApplyCh
 	ApplyCh chan raftapi.ApplyMsg
 }
@@ -324,35 +324,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		rf.mu.Lock()
 		if reply.Term > rf.PStates.CurrentTerm {
 			rf.InitFollower(reply.Term)
-			if rf.PeerCond != nil {
-				rf.PeerCond.Broadcast()
+			if rf.BeatCanceler != nil {
+				rf.BeatCanceler()
 			}
 		}
 		rf.mu.Unlock()
 	}
 	return ok
-}
-
-// NOTE: Should be locked before using.
-func (rf *Raft) SendHeartBeats() {
-	rf.LastHeartBeat = time.Now()
-	for i := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-		// Send HeartBeat to peers.
-		prevIdx := rf.NextIndex[i] - 1
-		prevTerm := rf.PStates.Logs[prevIdx].Term
-		args := AppendEntriesArgs{
-			Term:         rf.PStates.CurrentTerm,
-			LeaderID:     rf.me,
-			PrevLogIdx:   prevIdx,
-			PrevLogTerm:  prevTerm,
-			Entries:      []RaftLog{},
-			LeaderCommit: rf.CommitIdx,
-		}
-		go rf.sendAppendEntries(i, &args, &AppendEntriesReply{})
-	}
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -386,68 +364,85 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	rf.PStates.Logs = append(rf.PStates.Logs, rlog)
 	index, term = rf.LastLogIdxAndTerm()
 
-	rf.PeerCond.Broadcast()
-
 	return
 }
 
-func (rf *Raft) PeerWatcher(peer int) {
+func (rf *Raft) Beater(ctx context.Context) {
 	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			break
+		}
 		rf.mu.Lock()
-		for len(rf.PStates.Logs) <= rf.NextIndex[peer] {
-			if rf.Role != ROLE_LEADER {
-				rf.mu.Unlock()
-				return
-			}
-			rf.PeerCond.Wait()
+		if rf.Role != ROLE_LEADER {
+			rf.mu.Unlock()
+			return
 		}
+		rf.SendBeats()
 		rf.mu.Unlock()
-		for {
-			rf.mu.Lock()
-			if rf.Role != ROLE_LEADER {
-				rf.mu.Unlock()
-				return
-			}
-			nidx := rf.NextIndex[peer]
-			prevIdx := nidx - 1
-			prevTerm := rf.PStates.Logs[prevIdx].Term
+		time.Sleep(50 * time.Millisecond)
+	}
+}
 
-			args := AppendEntriesArgs{
-				Term:         rf.PStates.CurrentTerm,
-				LeaderID:     rf.me,
-				PrevLogIdx:   prevIdx,
-				PrevLogTerm:  prevTerm,
-				Entries:      rf.PStates.Logs[nidx:],
-				LeaderCommit: rf.CommitIdx,
-			}
-			rf.mu.Unlock()
-
-			var reply AppendEntriesReply
-			ok := rf.sendAppendEntries(peer, &args, &reply)
-			if !ok {
-				// Peer failed for now, giveup
-				break
-			}
-			rf.mu.Lock()
-
-			if !rf.CheckNodeConsistency(ROLE_LEADER, args.Term) {
-				rf.mu.Unlock()
-				return
-			}
-
-			if reply.Success {
-				// Update NextIndex & MatchIndex
-				newNextIndex := args.PrevLogIdx + len(args.Entries) + 1
-				rf.NextIndex[peer] = newNextIndex
-				rf.MatchIndex[peer] = newNextIndex - 1
-				rf.UpdateCommitIndex()
-				break
-			} else {
-				// Retry with a smaller index
-				rf.NextIndex[peer] /= 2
-			}
-			rf.mu.Unlock()
+// NOTE: Should be locked before using.
+func (rf *Raft) SendBeats() {
+	rf.LastHeartBeat = time.Now()
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
 		}
+		go rf.ReplicateToPeer(i)
+	}
+}
+
+func (rf *Raft) ReplicateToPeer(peer int) {
+	rf.mu.Lock()
+
+	if rf.Role != ROLE_LEADER {
+		rf.mu.Unlock()
+		return
+	}
+	nidx := rf.NextIndex[peer]
+	prevIdx := nidx - 1
+	prevTerm := rf.PStates.Logs[prevIdx].Term
+	entries := []RaftLog{}
+	if len(rf.PStates.Logs) > nidx {
+		entries = rf.PStates.Logs[nidx:]
+	}
+
+	args := AppendEntriesArgs{
+		Term:         rf.PStates.CurrentTerm,
+		LeaderID:     rf.me,
+		PrevLogIdx:   prevIdx,
+		PrevLogTerm:  prevTerm,
+		Entries:      entries,
+		LeaderCommit: rf.CommitIdx,
+	}
+	rf.mu.Unlock()
+	var reply AppendEntriesReply
+	ok := rf.sendAppendEntries(peer, &args, &reply)
+	if !ok {
+		// Peer failed for now, giveup
+		return
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if !rf.CheckNodeConsistency(ROLE_LEADER, args.Term) {
+		return
+	}
+
+	if reply.Success {
+		// Update NextIndex & MatchIndex
+		newNextIndex := args.PrevLogIdx + len(args.Entries) + 1
+		rf.NextIndex[peer] = newNextIndex
+		rf.MatchIndex[peer] = newNextIndex - 1
+		rf.UpdateCommitIndex()
+	} else {
+		// Retry with a smaller index
+		rf.NextIndex[peer]--
 	}
 }
 
@@ -475,16 +470,16 @@ func (rf *Raft) UpdateCommitIndex() {
 				})
 			}
 			rf.CommitIdx = N
-			rf.mu.Unlock()
 
-			for _, msg := range messagesToApply {
-				rf.ApplyCh <- msg
-			}
+			go func(c chan raftapi.ApplyMsg, msgs []raftapi.ApplyMsg) {
+				for _, msg := range messagesToApply {
+					rf.ApplyCh <- msg
+				}
+			}(rf.ApplyCh, messagesToApply)
 
 			return
 		}
 	}
-	rf.mu.Unlock()
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -528,30 +523,18 @@ func (rf *Raft) InitLeader() {
 	rf.Role = ROLE_LEADER
 	rf.NextIndex = make([]int, len(rf.peers))
 	rf.MatchIndex = make([]int, len(rf.peers))
-	rf.PeerCond = sync.NewCond(&rf.mu)
+	ctx, cancel := context.WithCancel(context.Background())
+	rf.BeatCanceler = cancel
 
 	rf.LastHeartBeat = time.Now()
 	// HeartBeat args
 	// No need to success, so only the first 2 argument is meaningful
-	lidx, lterm := rf.LastLogIdxAndTerm()
-	args := AppendEntriesArgs{
-		Term:         rf.PStates.CurrentTerm,
-		LeaderID:     rf.me,
-		PrevLogIdx:   lidx,
-		PrevLogTerm:  lterm,
-		Entries:      []RaftLog{},
-		LeaderCommit: rf.CommitIdx,
-	}
 	for i := range rf.peers {
-		rf.NextIndex[i] = lidx + 1
+		rf.NextIndex[i] = len(rf.PStates.Logs)
 		rf.MatchIndex[i] = 0
-		if i == rf.me {
-			// Send HeartBeat to peers.
-			continue
-		}
-		go rf.sendAppendEntries(i, &args, &AppendEntriesReply{})
-		go rf.PeerWatcher(i)
 	}
+
+	go rf.Beater(ctx)
 }
 
 func (rf *Raft) SingleElection(pidx int, args *RequestVoteArgs, votec chan int) {
@@ -628,9 +611,7 @@ func (rf *Raft) ticker() {
 		// Check if a leader election should be started.
 		rf.mu.Lock()
 		tdelta := time.Now().Sub(rf.LastHeartBeat)
-		if rf.Role == ROLE_LEADER {
-			rf.SendHeartBeats()
-		} else if tdelta > ELECTION_TIMEOUT {
+		if rf.Role != ROLE_LEADER && tdelta > ELECTION_TIMEOUT {
 			// Cancel previous election
 			if rf.ElectionCanceler != nil {
 				rf.ElectionCanceler()
