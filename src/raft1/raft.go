@@ -7,7 +7,7 @@ package raft
 // Make() creates a new raft peer that implements the raft interface.
 
 import (
-	//	"bytes"
+	// "bytes"
 	"cmp"
 	"context"
 	"math/rand"
@@ -15,7 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
+	// "6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	"6.5840/tester1"
@@ -37,7 +37,7 @@ const ELECTION_TIMEOUT time.Duration = 350 * time.Millisecond
 
 type RaftLog struct {
 	Term    int
-	Command string // TODO: Update command structure
+	Command interface{} // TODO: Update command structure
 }
 
 // Persistent State for Raft peers
@@ -68,6 +68,9 @@ type Raft struct {
 	// Leader specific states
 	NextIndex  []int
 	MatchIndex []int
+	PeerCond   *sync.Cond
+	// ApplyCh
+	ApplyCh chan raftapi.ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -82,6 +85,11 @@ func (rf *Raft) GetState() (int, bool) {
 	isleader = rf.Role == ROLE_LEADER
 	term = rf.PStates.CurrentTerm
 	return term, isleader
+}
+
+// Check node with expected node & term.
+func (rf *Raft) CheckNodeConsistency(erole Role, eterm int) bool {
+	return rf.Role == erole && rf.PStates.CurrentTerm == eterm
 }
 
 // save Raft's persistent state to stable storage,
@@ -203,7 +211,6 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	reply.Term = rf.PStates.CurrentTerm
 	reply.Success = false
 
@@ -211,6 +218,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	switch cmp.Compare(args.Term, rf.PStates.CurrentTerm) {
 	case -1:
 		// src is less recent, return
+		rf.mu.Unlock()
 		return
 	case 1:
 		// src is more recent, convert current to follower
@@ -224,8 +232,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Check if PrevLogIdx & PrevLogTerm matches
 	if args.PrevLogIdx >= len(rf.PStates.Logs) {
 		// TODO: Need proper handling, reject for now
+		rf.mu.Unlock()
 		return
 	} else if rf.PStates.Logs[args.PrevLogIdx].Term != args.PrevLogTerm {
+		rf.mu.Unlock()
 		return
 	}
 	// Success when matched
@@ -247,8 +257,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// Update commit index
 	if args.LeaderCommit > rf.CommitIdx {
-		rf.CommitIdx = min(args.LeaderCommit, len(rf.PStates.Logs)-1)
+		newCommitIdx := min(args.LeaderCommit, len(rf.PStates.Logs)-1)
+
+		messagesToApply := []raftapi.ApplyMsg{}
+		for i := rf.CommitIdx + 1; i <= newCommitIdx; i++ {
+			messagesToApply = append(messagesToApply, raftapi.ApplyMsg{
+				CommandValid: true,
+				CommandIndex: i,
+				Command:      rf.PStates.Logs[i].Command,
+			})
+		}
+		rf.CommitIdx = newCommitIdx
+
+		rf.mu.Unlock()
+
+		for _, msg := range messagesToApply {
+			rf.ApplyCh <- msg
+		}
+		return
 	}
+	rf.mu.Unlock()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -280,30 +308,50 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	if ok {
+		rf.mu.Lock()
+		if reply.Term > rf.PStates.CurrentTerm {
+			rf.InitFollower(reply.Term)
+		}
+		rf.mu.Unlock()
+	}
 	return ok
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	if ok {
+		rf.mu.Lock()
+		if reply.Term > rf.PStates.CurrentTerm {
+			rf.InitFollower(reply.Term)
+			if rf.PeerCond != nil {
+				rf.PeerCond.Broadcast()
+			}
+		}
+		rf.mu.Unlock()
+	}
 	return ok
 }
 
+// NOTE: Should be locked before using.
 func (rf *Raft) SendHeartBeats() {
 	rf.LastHeartBeat = time.Now()
-	lidx, lterm := rf.LastLogIdxAndTerm()
-	args := AppendEntriesArgs{
-		Term:         rf.PStates.CurrentTerm,
-		LeaderID:     rf.me,
-		PrevLogIdx:   lidx,
-		PrevLogTerm:  lterm,
-		Entries:      []RaftLog{},
-		LeaderCommit: rf.CommitIdx,
-	}
 	for i := range rf.peers {
-		if i != rf.me {
-			// Send HeartBeat to peers.
-			go rf.sendAppendEntries(i, &args, &AppendEntriesReply{})
+		if i == rf.me {
+			continue
 		}
+		// Send HeartBeat to peers.
+		prevIdx := rf.NextIndex[i] - 1
+		prevTerm := rf.PStates.Logs[prevIdx].Term
+		args := AppendEntriesArgs{
+			Term:         rf.PStates.CurrentTerm,
+			LeaderID:     rf.me,
+			PrevLogIdx:   prevIdx,
+			PrevLogTerm:  prevTerm,
+			Entries:      []RaftLog{},
+			LeaderCommit: rf.CommitIdx,
+		}
+		go rf.sendAppendEntries(i, &args, &AppendEntriesReply{})
 	}
 }
 
@@ -319,14 +367,124 @@ func (rf *Raft) SendHeartBeats() {
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) {
+	index = -1
+	term = -1
+	isLeader = true
 
 	// Your code here (3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	isLeader = rf.Role == ROLE_LEADER
+	if !isLeader {
+		return
+	}
+	rlog := RaftLog{
+		Term:    rf.PStates.CurrentTerm,
+		Command: command,
+	}
+	rf.PStates.Logs = append(rf.PStates.Logs, rlog)
+	index, term = rf.LastLogIdxAndTerm()
 
-	return index, term, isLeader
+	rf.PeerCond.Broadcast()
+
+	return
+}
+
+func (rf *Raft) PeerWatcher(peer int) {
+	for {
+		rf.mu.Lock()
+		for len(rf.PStates.Logs) <= rf.NextIndex[peer] {
+			if rf.Role != ROLE_LEADER {
+				rf.mu.Unlock()
+				return
+			}
+			rf.PeerCond.Wait()
+		}
+		rf.mu.Unlock()
+		for {
+			rf.mu.Lock()
+			if rf.Role != ROLE_LEADER {
+				rf.mu.Unlock()
+				return
+			}
+			nidx := rf.NextIndex[peer]
+			prevIdx := nidx - 1
+			prevTerm := rf.PStates.Logs[prevIdx].Term
+
+			args := AppendEntriesArgs{
+				Term:         rf.PStates.CurrentTerm,
+				LeaderID:     rf.me,
+				PrevLogIdx:   prevIdx,
+				PrevLogTerm:  prevTerm,
+				Entries:      rf.PStates.Logs[nidx:],
+				LeaderCommit: rf.CommitIdx,
+			}
+			rf.mu.Unlock()
+
+			var reply AppendEntriesReply
+			ok := rf.sendAppendEntries(peer, &args, &reply)
+			if !ok {
+				// Peer failed for now, giveup
+				break
+			}
+			rf.mu.Lock()
+
+			if !rf.CheckNodeConsistency(ROLE_LEADER, args.Term) {
+				rf.mu.Unlock()
+				return
+			}
+
+			if reply.Success {
+				// Update NextIndex & MatchIndex
+				newNextIndex := args.PrevLogIdx + len(args.Entries) + 1
+				rf.NextIndex[peer] = newNextIndex
+				rf.MatchIndex[peer] = newNextIndex - 1
+				rf.UpdateCommitIndex()
+				break
+			} else {
+				// Retry with a smaller index
+				rf.NextIndex[peer] /= 2
+			}
+			rf.mu.Unlock()
+		}
+	}
+}
+
+// Update leader's commit index to commit the logs to the state machine
+func (rf *Raft) UpdateCommitIndex() {
+	for N := len(rf.PStates.Logs) - 1; N > rf.CommitIdx; N-- {
+		if rf.PStates.CurrentTerm != rf.PStates.Logs[N].Term {
+			break
+		}
+
+		count := 1
+		for i := range rf.peers {
+			if i != rf.me && rf.MatchIndex[i] >= N {
+				count++
+			}
+		}
+
+		if count > len(rf.peers)/2 {
+			messagesToApply := []raftapi.ApplyMsg{}
+			for i := rf.CommitIdx + 1; i <= N; i++ {
+				messagesToApply = append(messagesToApply, raftapi.ApplyMsg{
+					CommandValid: true,
+					CommandIndex: i,
+					Command:      rf.PStates.Logs[i].Command,
+				})
+			}
+			rf.CommitIdx = N
+			rf.mu.Unlock()
+
+			for _, msg := range messagesToApply {
+				rf.ApplyCh <- msg
+			}
+
+			return
+		}
+	}
+	rf.mu.Unlock()
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -370,6 +528,7 @@ func (rf *Raft) InitLeader() {
 	rf.Role = ROLE_LEADER
 	rf.NextIndex = make([]int, len(rf.peers))
 	rf.MatchIndex = make([]int, len(rf.peers))
+	rf.PeerCond = sync.NewCond(&rf.mu)
 
 	rf.LastHeartBeat = time.Now()
 	// HeartBeat args
@@ -386,10 +545,12 @@ func (rf *Raft) InitLeader() {
 	for i := range rf.peers {
 		rf.NextIndex[i] = lidx + 1
 		rf.MatchIndex[i] = 0
-		if i != rf.me {
+		if i == rf.me {
 			// Send HeartBeat to peers.
-			go rf.sendAppendEntries(i, &args, &AppendEntriesReply{})
+			continue
 		}
+		go rf.sendAppendEntries(i, &args, &AppendEntriesReply{})
+		go rf.PeerWatcher(i)
 	}
 }
 
@@ -404,7 +565,7 @@ func (rf *Raft) SingleElection(pidx int, args *RequestVoteArgs, votec chan int) 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.Role != ROLE_CANDIDATE || rf.PStates.CurrentTerm != args.Term {
+	if !rf.CheckNodeConsistency(ROLE_CANDIDATE, args.Term) {
 		// -1 to abort election
 		votec <- -1
 		return
@@ -523,7 +684,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.PStates.CurrentTerm = 0
 	rf.PStates.VotedFor = -1
 	rf.PStates.Logs = []RaftLog{}
+	rf.CommitIdx = 0
+	rf.LastApplied = 0
 	rf.LastHeartBeat = time.Now()
+	rf.ApplyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -531,7 +695,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	if len(rf.PStates.Logs) == 0 {
 		rf.PStates.Logs = append(rf.PStates.Logs, RaftLog{
 			Term:    0,
-			Command: "",
+			Command: nil,
 		})
 	}
 
