@@ -39,7 +39,7 @@ const BEAT_COOLDOWN time.Duration = 40 * time.Millisecond
 
 type RaftLog struct {
 	Term    int
-	Command interface{} // TODO: Update command structure
+	Command interface{}
 }
 
 // Persistent State for Raft peers
@@ -340,7 +340,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Check if PrevLogIdx & PrevLogTerm matches
 	if prevIdx >= len(rf.PStates.Logs) {
-		// TODO: Need proper handling, reject for now
 		reply.XTerm = -1
 		reply.XLen = len(rf.PStates.Logs)
 		return
