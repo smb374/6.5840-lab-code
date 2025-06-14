@@ -35,6 +35,7 @@ const (
 )
 
 const ELECTION_TIMEOUT time.Duration = 350 * time.Millisecond
+const BEAT_COOLDOWN time.Duration = 40 * time.Millisecond
 
 type RaftLog struct {
 	Term    int
@@ -73,6 +74,7 @@ type Raft struct {
 	// Leader specific states
 	NextIndex    []int
 	MatchIndex   []int
+	Processing   []bool
 	BeatCanceler context.CancelFunc
 	// ApplyCh
 	ApplyCh chan raftapi.ApplyMsg
@@ -517,7 +519,7 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	return
 }
 
-func (rf *Raft) Beater(ctx context.Context) {
+func (rf *Raft) PeerBeater(ctx context.Context, peer int) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -530,20 +532,9 @@ func (rf *Raft) Beater(ctx context.Context) {
 			rf.mu.Unlock()
 			return
 		}
-		rf.SendBeats()
+		go rf.ReplicateToPeer(peer)
 		rf.mu.Unlock()
-		time.Sleep(50 * time.Millisecond)
-	}
-}
-
-// NOTE: Should be locked before using.
-func (rf *Raft) SendBeats() {
-	rf.LastHeartBeat = time.Now()
-	for i := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-		go rf.ReplicateToPeer(i)
+		time.Sleep(BEAT_COOLDOWN)
 	}
 }
 
@@ -626,6 +617,8 @@ func (rf *Raft) ReplicateToPeer(peer int) {
 				return
 			}
 		}
+		// Fast retry
+		go rf.ReplicateToPeer(peer)
 	}
 	rf.mu.Unlock()
 }
@@ -701,6 +694,12 @@ func (rf *Raft) ApplySnapshot(index, term int, snapshot []byte) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	if rf.ElectionCanceler != nil {
+		rf.ElectionCanceler()
+	}
+	if rf.BeatCanceler != nil {
+		rf.BeatCanceler()
+	}
 }
 
 func (rf *Raft) killed() bool {
@@ -732,8 +731,7 @@ func (rf *Raft) InitLeader() {
 	rf.Role = ROLE_LEADER
 	rf.NextIndex = make([]int, len(rf.peers))
 	rf.MatchIndex = make([]int, len(rf.peers))
-	ctx, cancel := context.WithCancel(context.Background())
-	rf.BeatCanceler = cancel
+	cancelers := []context.CancelFunc{}
 
 	rf.LastHeartBeat = time.Now()
 	// HeartBeat args
@@ -741,9 +739,18 @@ func (rf *Raft) InitLeader() {
 	for i := range rf.peers {
 		rf.NextIndex[i] = len(rf.PStates.Logs)
 		rf.MatchIndex[i] = 0
+		if i != rf.me {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancelers = append(cancelers, cancel)
+			go rf.PeerBeater(ctx, i)
+		}
 	}
 
-	go rf.Beater(ctx)
+	rf.BeatCanceler = func() {
+		for _, c := range cancelers {
+			c()
+		}
+	}
 }
 
 func (rf *Raft) SingleElection(pidx int, args *RequestVoteArgs, votec chan int) {
