@@ -62,6 +62,7 @@ type Raft struct {
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	Ctx              context.Context
 	Role             Role
 	PStates          RaftState
 	CommitIdx        int
@@ -740,7 +741,7 @@ func (rf *Raft) InitLeader() {
 		rf.NextIndex[i] = len(rf.PStates.Logs)
 		rf.MatchIndex[i] = 0
 		if i != rf.me {
-			ctx, cancel := context.WithCancel(context.Background())
+			ctx, cancel := context.WithCancel(rf.Ctx)
 			cancelers = append(cancelers, cancel)
 			go rf.PeerBeater(ctx, i)
 		}
@@ -848,7 +849,7 @@ func (rf *Raft) ticker() {
 			}
 			// Update LastHeartBeat, create context, fire Election goroutine
 			rf.LastHeartBeat = time.Now()
-			ctx, cancel := context.WithTimeout(context.Background(), ELECTION_TIMEOUT)
+			ctx, cancel := context.WithTimeout(rf.Ctx, ELECTION_TIMEOUT)
 			rf.ElectionCanceler = cancel
 			go rf.Election(ctx, args)
 		}
@@ -878,6 +879,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (3A, 3B, 3C).
+	rf.Ctx = context.Background()
 	rf.Role = ROLE_FOLLOWER
 	rf.PStates.CurrentTerm = 0
 	rf.PStates.VotedFor = -1
