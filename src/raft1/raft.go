@@ -43,9 +43,11 @@ type RaftLog struct {
 
 // Persistent State for Raft peers
 type RaftState struct {
-	CurrentTerm int
-	VotedFor    int
-	Logs        []RaftLog
+	CurrentTerm      int
+	VotedFor         int
+	Logs             []RaftLog
+	LastIncludedIdx  int
+	LastIncludedTerm int
 }
 
 // A Go object implementing a single Raft peer.
@@ -66,10 +68,13 @@ type Raft struct {
 	LastHeartBeat    time.Time
 	ElectionCanceler context.CancelFunc
 	LeaderID         int
+	// Snapshot
+	SnapshotBuf []byte
 	// Leader specific states
-	NextIndex    []int
-	MatchIndex   []int
-	BeatCanceler context.CancelFunc
+	NextIndex          []int
+	MatchIndex         []int
+	BeatCanceler       context.CancelFunc
+	InstallingSnapshot []bool
 	// ApplyCh
 	ApplyCh chan raftapi.ApplyMsg
 }
@@ -113,7 +118,7 @@ func (rf *Raft) persist() {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.PStates)
 	state := w.Bytes()
-	rf.persister.Save(state, nil)
+	rf.persister.Save(state, rf.SnapshotBuf)
 }
 
 // restore previously persisted state.
@@ -158,7 +163,88 @@ func (rf *Raft) PersistBytes() int {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	sidx := index - rf.PStates.LastIncludedIdx
+	if sidx < 0 || sidx >= len(rf.PStates.Logs) {
+		// Invalid index to work with
+		return
+	}
+	term := rf.PStates.Logs[sidx].Term
+
+	newLogs := []RaftLog{
+		{
+			Term:    term,
+			Command: nil,
+		},
+	}
+	if sidx+1 < len(rf.PStates.Logs) {
+		newLogs = append(newLogs, rf.PStates.Logs[sidx+1:]...)
+	}
+	rf.PStates.Logs = newLogs
+	rf.PStates.LastIncludedIdx = index
+	rf.PStates.LastIncludedTerm = term
+	rf.SnapshotBuf = snapshot
+
+	rf.CommitIdx = max(rf.CommitIdx, index)
+	rf.LastApplied = max(rf.LastApplied, index)
+
+	rf.persist()
+}
+
+type InstallSnapshotArgs struct {
+	Term             int
+	LeaderID         int
+	LastIncludedIdx  int
+	LastIncludedTerm int
+	Data             []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.PStates.CurrentTerm
+
+	switch cmp.Compare(args.Term, rf.PStates.CurrentTerm) {
+	case -1:
+		return
+	case 1:
+		// Update term & become follower
+		rf.InitFollower(args.Term)
+		rf.persist()
+	}
+
+	rf.LastHeartBeat = time.Now()
+	rf.LeaderID = args.LeaderID
+
+	if args.LastIncludedIdx <= rf.CommitIdx {
+		return
+	}
+
+	rf.PStates.LastIncludedIdx = args.LastIncludedIdx
+	rf.PStates.LastIncludedTerm = args.LastIncludedTerm
+	rf.SnapshotBuf = args.Data
+
+	rf.CommitIdx = args.LastIncludedIdx
+	rf.LastApplied = args.LastIncludedIdx
+
+	newLogs := []RaftLog{
+		{
+			Term:    args.LastIncludedTerm,
+			Command: nil,
+		},
+	}
+
+	rf.PStates.Logs = newLogs
+	rf.persist()
+
+	rf.ApplySnapshot(args.LastIncludedIdx, args.LastIncludedTerm, rf.SnapshotBuf)
 }
 
 // example RequestVote RPC arguments structure.
@@ -248,31 +334,32 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Update HeartBeat time & leader ID
 	rf.LastHeartBeat = time.Now()
 	rf.LeaderID = args.LeaderID
+	prevIdx := args.PrevLogIdx - rf.PStates.LastIncludedIdx
 
 	// Check if PrevLogIdx & PrevLogTerm matches
-	if args.PrevLogIdx >= len(rf.PStates.Logs) {
+	if prevIdx >= len(rf.PStates.Logs) {
 		// TODO: Need proper handling, reject for now
 		reply.XTerm = -1
 		reply.XLen = len(rf.PStates.Logs)
 		return
 	}
 
-	term := rf.PStates.Logs[args.PrevLogIdx].Term
+	term := rf.PStates.Logs[prevIdx].Term
 	if term != args.PrevLogTerm {
 		reply.XTerm = term
 
-		idx := args.PrevLogIdx
+		idx := prevIdx
 		for idx > 0 && rf.PStates.Logs[idx-1].Term == term {
 			idx--
 		}
-		reply.XIndex = idx
+		reply.XIndex = idx + rf.PStates.LastIncludedIdx
 		return
 	}
 	// Success when matched
 	reply.Success = true
 	// Update log etries in current node
 	for i, e := range args.Entries {
-		idx := args.PrevLogIdx + 1 + i
+		idx := prevIdx + 1 + i
 		if idx < len(rf.PStates.Logs) {
 			// Overwrite inconsistent entries in current node
 			if rf.PStates.Logs[idx].Term != e.Term {
@@ -290,7 +377,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// Update commit index
 	if args.LeaderCommit > rf.CommitIdx {
-		newCommitIdx := min(args.LeaderCommit, len(rf.PStates.Logs)-1)
+		lidx, _ := rf.LastLogIdxAndTerm()
+		newCommitIdx := min(args.LeaderCommit, lidx)
 		rf.CommitIdx = newCommitIdx
 
 		go rf.ApplyMessages()
@@ -346,6 +434,55 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		}
 	}
 	return ok
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if ok && reply.Term > rf.PStates.CurrentTerm {
+		rf.InitFollower(reply.Term)
+		if rf.BeatCanceler != nil {
+			rf.BeatCanceler()
+		}
+	}
+	return ok
+}
+
+func (rf *Raft) PeerInstallSnapshot(peer int) {
+	snapshot := rf.persister.ReadSnapshot()
+	rf.mu.Lock()
+	if rf.Role != ROLE_LEADER || rf.InstallingSnapshot[peer] {
+		rf.mu.Unlock()
+		return
+	}
+
+	rf.InstallingSnapshot[peer] = true
+	args := InstallSnapshotArgs{
+		Term:             rf.PStates.CurrentTerm,
+		LeaderID:         rf.me,
+		LastIncludedIdx:  rf.PStates.LastIncludedIdx,
+		LastIncludedTerm: rf.PStates.LastIncludedTerm,
+		Data:             snapshot,
+	}
+	rf.mu.Unlock()
+
+	var reply InstallSnapshotReply
+	ok := rf.sendInstallSnapshot(peer, &args, &reply)
+	if !ok {
+		return
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.InstallingSnapshot[peer] = false
+
+	if !rf.CheckNodeConsistency(ROLE_LEADER, args.Term) {
+		return
+	}
+
+	rf.NextIndex[peer] = rf.PStates.LastIncludedIdx + 1
+	rf.MatchIndex[peer] = rf.PStates.LastIncludedIdx
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -416,16 +553,24 @@ func (rf *Raft) SendBeats() {
 func (rf *Raft) ReplicateToPeer(peer int) {
 	rf.mu.Lock()
 
-	if rf.Role != ROLE_LEADER {
+	if rf.Role != ROLE_LEADER || rf.InstallingSnapshot[peer] {
 		rf.mu.Unlock()
 		return
 	}
+
+	lidx, _ := rf.LastLogIdxAndTerm()
 	nidx := rf.NextIndex[peer]
+	if nidx <= rf.PStates.LastIncludedIdx {
+		// Peer fall behind, install snapshot
+		rf.mu.Unlock()
+		rf.PeerInstallSnapshot(peer)
+		return
+	}
 	prevIdx := nidx - 1
-	prevTerm := rf.PStates.Logs[prevIdx].Term
+	prevTerm := rf.PStates.Logs[prevIdx-rf.PStates.LastIncludedIdx].Term
 	entries := []RaftLog{}
-	if len(rf.PStates.Logs) > nidx {
-		entries = rf.PStates.Logs[nidx:]
+	if lidx >= nidx {
+		entries = rf.PStates.Logs[nidx-rf.PStates.LastIncludedIdx:]
 	}
 
 	args := AppendEntriesArgs{
@@ -444,9 +589,9 @@ func (rf *Raft) ReplicateToPeer(peer int) {
 		return
 	}
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	if !rf.CheckNodeConsistency(ROLE_LEADER, args.Term) {
+		rf.mu.Unlock()
 		return
 	}
 
@@ -473,19 +618,27 @@ func (rf *Raft) ReplicateToPeer(peer int) {
 
 			if idx != -1 {
 				// There's a matching term @ idx, use its next as NextIndex
-				rf.NextIndex[peer] = idx + 1
-			} else {
+				rf.NextIndex[peer] = idx + 1 + rf.PStates.LastIncludedIdx
+			} else if reply.XIndex > rf.PStates.LastIncludedIdx {
 				// Otherwise, set NextIndex to the first index that the peer has that term.
 				rf.NextIndex[peer] = reply.XIndex
+			} else {
+				// Peer fall behind, install snapshot
+				rf.mu.Unlock()
+				rf.PeerInstallSnapshot(peer)
+				return
 			}
 		}
 	}
+	rf.mu.Unlock()
 }
 
 // Update leader's commit index to commit the logs to the state machine
 func (rf *Raft) UpdateCommitIndex() {
-	for N := len(rf.PStates.Logs) - 1; N > rf.CommitIdx; N-- {
-		if rf.PStates.CurrentTerm != rf.PStates.Logs[N].Term {
+	lidx, _ := rf.LastLogIdxAndTerm()
+	for N := lidx; N > rf.CommitIdx; N-- {
+		idx := N - rf.PStates.LastIncludedIdx
+		if rf.PStates.CurrentTerm != rf.PStates.Logs[idx].Term {
 			break
 		}
 
@@ -510,10 +663,11 @@ func (rf *Raft) ApplyMessages() {
 	messagesToApply := []raftapi.ApplyMsg{}
 	for rf.LastApplied < rf.CommitIdx {
 		rf.LastApplied++
+		aidx := rf.LastApplied - rf.PStates.LastIncludedIdx
 		messagesToApply = append(messagesToApply, raftapi.ApplyMsg{
 			CommandValid: true,
 			CommandIndex: rf.LastApplied,
-			Command:      rf.PStates.Logs[rf.LastApplied].Command,
+			Command:      rf.PStates.Logs[aidx].Command,
 		})
 	}
 	rf.mu.Unlock()
@@ -523,6 +677,19 @@ func (rf *Raft) ApplyMessages() {
 			rf.ApplyCh <- msg
 		}
 	}
+}
+
+func (rf *Raft) ApplySnapshot(index, term int, snapshot []byte) {
+	msg := raftapi.ApplyMsg{
+		CommandValid: false,
+
+		SnapshotValid: true,
+		SnapshotIndex: index,
+		SnapshotTerm:  term,
+		Snapshot:      snapshot,
+	}
+
+	rf.ApplyCh <- msg
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -546,9 +713,10 @@ func (rf *Raft) killed() bool {
 
 // NOTE: Need to be locked before using
 func (rf *Raft) LastLogIdxAndTerm() (idx int, term int) {
-	idx = len(rf.PStates.Logs) - 1
-	if idx >= 0 {
-		term = rf.PStates.Logs[idx].Term
+	sidx := len(rf.PStates.Logs) - 1
+	idx = rf.PStates.LastIncludedIdx + sidx
+	if sidx >= 0 {
+		term = rf.PStates.Logs[sidx].Term
 	}
 	return
 
@@ -567,6 +735,7 @@ func (rf *Raft) InitLeader() {
 	rf.Role = ROLE_LEADER
 	rf.NextIndex = make([]int, len(rf.peers))
 	rf.MatchIndex = make([]int, len(rf.peers))
+	rf.InstallingSnapshot = make([]bool, len(rf.peers))
 	ctx, cancel := context.WithCancel(context.Background())
 	rf.BeatCanceler = cancel
 
@@ -576,6 +745,7 @@ func (rf *Raft) InitLeader() {
 	for i := range rf.peers {
 		rf.NextIndex[i] = len(rf.PStates.Logs)
 		rf.MatchIndex[i] = 0
+		rf.InstallingSnapshot[i] = false
 	}
 
 	go rf.Beater(ctx)
@@ -714,9 +884,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.LastApplied = 0
 	rf.LastHeartBeat = time.Time{}
 	rf.ApplyCh = applyCh
+	// Snapshot
+	rf.PStates.LastIncludedIdx = 0
+	rf.PStates.LastIncludedTerm = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	// read snapshot
+	rf.SnapshotBuf = persister.ReadSnapshot()
+
+	rf.CommitIdx = rf.PStates.LastIncludedIdx
+	rf.LastApplied = rf.PStates.LastIncludedIdx
 
 	if len(rf.PStates.Logs) == 0 {
 		rf.PStates.Logs = append(rf.PStates.Logs, RaftLog{
