@@ -71,10 +71,9 @@ type Raft struct {
 	// Snapshot
 	SnapshotBuf []byte
 	// Leader specific states
-	NextIndex          []int
-	MatchIndex         []int
-	BeatCanceler       context.CancelFunc
-	InstallingSnapshot []bool
+	NextIndex    []int
+	MatchIndex   []int
+	BeatCanceler context.CancelFunc
 	// ApplyCh
 	ApplyCh chan raftapi.ApplyMsg
 }
@@ -452,12 +451,11 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 func (rf *Raft) PeerInstallSnapshot(peer int) {
 	snapshot := rf.persister.ReadSnapshot()
 	rf.mu.Lock()
-	if rf.Role != ROLE_LEADER || rf.InstallingSnapshot[peer] {
+	if rf.Role != ROLE_LEADER {
 		rf.mu.Unlock()
 		return
 	}
 
-	rf.InstallingSnapshot[peer] = true
 	args := InstallSnapshotArgs{
 		Term:             rf.PStates.CurrentTerm,
 		LeaderID:         rf.me,
@@ -475,7 +473,6 @@ func (rf *Raft) PeerInstallSnapshot(peer int) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.InstallingSnapshot[peer] = false
 
 	if !rf.CheckNodeConsistency(ROLE_LEADER, args.Term) {
 		return
@@ -553,7 +550,7 @@ func (rf *Raft) SendBeats() {
 func (rf *Raft) ReplicateToPeer(peer int) {
 	rf.mu.Lock()
 
-	if rf.Role != ROLE_LEADER || rf.InstallingSnapshot[peer] {
+	if rf.Role != ROLE_LEADER {
 		rf.mu.Unlock()
 		return
 	}
@@ -735,7 +732,6 @@ func (rf *Raft) InitLeader() {
 	rf.Role = ROLE_LEADER
 	rf.NextIndex = make([]int, len(rf.peers))
 	rf.MatchIndex = make([]int, len(rf.peers))
-	rf.InstallingSnapshot = make([]bool, len(rf.peers))
 	ctx, cancel := context.WithCancel(context.Background())
 	rf.BeatCanceler = cancel
 
@@ -745,7 +741,6 @@ func (rf *Raft) InitLeader() {
 	for i := range rf.peers {
 		rf.NextIndex[i] = len(rf.PStates.Logs)
 		rf.MatchIndex[i] = 0
-		rf.InstallingSnapshot[i] = false
 	}
 
 	go rf.Beater(ctx)
