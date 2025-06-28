@@ -22,8 +22,8 @@ import (
 	"6.5840/tester1"
 )
 
-func ceildiv(x int, y int) int {
-	return (x + y - 1) / y
+func majority(x int) int {
+	return x/2 + 1
 }
 
 type Role int
@@ -270,9 +270,9 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
-	lastLogIdx, lastLogTerm := rf.LastLogIdxAndTerm()
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	lastLogIdx, lastLogTerm := rf.LastLogIdxAndTerm()
 
 	reply.Term = rf.PStates.CurrentTerm
 	reply.VoteGranted = false
@@ -525,7 +525,6 @@ func (rf *Raft) PeerBeater(ctx context.Context, peer int) {
 		case <-ctx.Done():
 			return
 		default:
-			break
 		}
 		rf.mu.Lock()
 		if rf.Role != ROLE_LEADER {
@@ -639,7 +638,7 @@ func (rf *Raft) UpdateCommitIndex() {
 			}
 		}
 
-		if count >= ceildiv(len(rf.peers), 2) {
+		if count >= majority(len(rf.peers)) {
 			rf.CommitIdx = N
 			go rf.ApplyMessages()
 
@@ -736,8 +735,9 @@ func (rf *Raft) InitLeader() {
 	rf.LastHeartBeat = time.Now()
 	// HeartBeat args
 	// No need to success, so only the first 2 argument is meaningful
+	lidx, _ := rf.LastLogIdxAndTerm()
 	for i := range rf.peers {
-		rf.NextIndex[i] = len(rf.PStates.Logs)
+		rf.NextIndex[i] = lidx + 1
 		rf.MatchIndex[i] = 0
 		if i != rf.me {
 			ctx, cancel := context.WithCancel(rf.Ctx)
@@ -813,9 +813,9 @@ func (rf *Raft) Election(ctx context.Context, args RequestVoteArgs) {
 			votes += v
 		}
 
-		if votes >= ceildiv(len(rf.peers), 2) {
+		if votes >= majority(len(rf.peers)) {
 			rf.InitLeader()
-			break
+			return
 		}
 	}
 }
@@ -826,7 +826,7 @@ func (rf *Raft) ticker() {
 		// Your code here (3A)
 		// Check if a leader election should be started.
 		rf.mu.Lock()
-		tdelta := time.Now().Sub(rf.LastHeartBeat)
+		tdelta := time.Since(rf.LastHeartBeat)
 		if rf.Role != ROLE_LEADER && tdelta > ELECTION_TIMEOUT {
 			// Cancel previous election
 			if rf.ElectionCanceler != nil {
