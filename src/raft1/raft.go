@@ -699,6 +699,8 @@ func (rf *Raft) Kill() {
 	if rf.BeatCanceler != nil {
 		rf.BeatCanceler()
 	}
+
+	close(rf.ApplyCh)
 }
 
 func (rf *Raft) killed() bool {
@@ -718,10 +720,15 @@ func (rf *Raft) LastLogIdxAndTerm() (idx int, term int) {
 }
 
 func (rf *Raft) InitFollower(new_term int) {
+	oldRole := rf.Role
 	rf.Role = ROLE_FOLLOWER
 	rf.PStates.CurrentTerm = new_term
 	rf.PStates.VotedFor = -1
 	rf.persist()
+
+	if oldRole == ROLE_LEADER {
+		rf.ApplyCh <- raftapi.ApplyMsg{IsDemotion: true, DemotedTerm: new_term}
+	}
 }
 
 func (rf *Raft) InitLeader() {
