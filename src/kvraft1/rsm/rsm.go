@@ -170,6 +170,14 @@ loop:
 				opc, ok := rsm.OpResult[msg.CommandIndex]
 				term, _ := rsm.Raft().GetState()
 				rsm.StateSize++
+				if rsm.StateSize >= rsm.maxraftstate && rsm.maxraftstate != -1 {
+					go func() {
+						rsm.Lock.Lock()
+						defer rsm.Lock.Unlock()
+						snapshot := rsm.sm.Snapshot()
+						rsm.Raft().Snapshot(msg.CommandIndex, snapshot)
+					}()
+				}
 				rsm.Lock.Unlock()
 				if ok {
 					if opc.term == term {

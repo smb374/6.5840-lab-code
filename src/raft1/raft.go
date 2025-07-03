@@ -77,6 +77,7 @@ type Raft struct {
 	MatchIndex   []int
 	Processing   []bool
 	BeatCanceler context.CancelFunc
+	BeatSignals  []chan bool
 	// ApplyCh
 	ApplyCh chan raftapi.ApplyMsg
 }
@@ -520,33 +521,37 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	index, term = rf.LastLogIdxAndTerm()
 
 	for p := range rf.peers {
+		if rf.killed() {
+			return
+		}
 		if p == rf.me {
 			continue
 		}
 		go func() {
-			time.Sleep(25 * time.Millisecond)
-			rf.ReplicateToPeer(p)
+			select {
+			case rf.BeatSignals[p] <- true:
+			case <-time.After(BEAT_COOLDOWN):
+			}
 		}()
 	}
 
 	return
 }
 
-func (rf *Raft) PeerBeater(ctx context.Context, peer int) {
+func (rf *Raft) PeerBeater(ctx context.Context, peer int, sig chan bool) {
+	go rf.ReplicateToPeer(peer)
+	ticker := time.NewTicker(BEAT_COOLDOWN)
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		default:
+		case <-rf.BeatSignals[peer]:
+			ticker.Reset(BEAT_COOLDOWN)
+			go rf.ReplicateToPeer(peer)
+		case <-ticker.C:
+			go rf.ReplicateToPeer(peer)
 		}
-		rf.mu.Lock()
-		if rf.Role != ROLE_LEADER {
-			rf.mu.Unlock()
-			return
-		}
-		go rf.ReplicateToPeer(peer)
-		rf.mu.Unlock()
-		time.Sleep(BEAT_COOLDOWN)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -769,7 +774,7 @@ func (rf *Raft) InitLeader() {
 		if i != rf.me {
 			ctx, cancel := context.WithCancel(rf.Ctx)
 			cancelers = append(cancelers, cancel)
-			go rf.PeerBeater(ctx, i)
+			go rf.PeerBeater(ctx, i, rf.BeatSignals[i])
 		}
 	}
 
@@ -914,6 +919,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.LastApplied = 0
 	rf.LastHeartBeat = time.Time{}
 	rf.ApplyCh = applyCh
+	rf.BeatSignals = make([]chan bool, len(rf.peers))
+
+	for p := range rf.peers {
+		rf.BeatSignals[p] = make(chan bool)
+	}
 	// Snapshot
 	rf.PStates.LastIncludedIdx = 0
 	rf.PStates.LastIncludedTerm = 0
