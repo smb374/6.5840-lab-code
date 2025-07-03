@@ -339,7 +339,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	prevIdx := args.PrevLogIdx - rf.PStates.LastIncludedIdx
 
 	// Check if PrevLogIdx & PrevLogTerm matches
-	if prevIdx >= len(rf.PStates.Logs) {
+	if prevIdx < 0 {
+		reply.XIndex = rf.PStates.LastIncludedIdx
+		return
+	} else if prevIdx >= len(rf.PStates.Logs) {
 		reply.XTerm = -1
 		reply.XLen = len(rf.PStates.Logs)
 		return
@@ -516,6 +519,16 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	rf.persist()
 	index, term = rf.LastLogIdxAndTerm()
 
+	for p := range rf.peers {
+		if p == rf.me {
+			continue
+		}
+		go func() {
+			time.Sleep(25 * time.Millisecond)
+			rf.ReplicateToPeer(p)
+		}()
+	}
+
 	return
 }
 
@@ -616,8 +629,6 @@ func (rf *Raft) ReplicateToPeer(peer int) {
 				return
 			}
 		}
-		// Fast retry
-		go rf.ReplicateToPeer(peer)
 	}
 	rf.mu.Unlock()
 }
@@ -663,6 +674,9 @@ func (rf *Raft) ApplyMessages() {
 
 	if len(messagesToApply) != 0 {
 		for _, msg := range messagesToApply {
+			if rf.killed() {
+				return
+			}
 			rf.ApplyCh <- msg
 		}
 	}
@@ -678,6 +692,9 @@ func (rf *Raft) ApplySnapshot(index, term int, snapshot []byte) {
 		Snapshot:      snapshot,
 	}
 
+	if rf.killed() {
+		return
+	}
 	rf.ApplyCh <- msg
 }
 
@@ -727,6 +744,9 @@ func (rf *Raft) InitFollower(new_term int) {
 	rf.persist()
 
 	if oldRole == ROLE_LEADER {
+		if rf.killed() {
+			return
+		}
 		rf.ApplyCh <- raftapi.ApplyMsg{IsDemotion: true, DemotedTerm: new_term}
 	}
 }

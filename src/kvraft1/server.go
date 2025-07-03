@@ -35,10 +35,10 @@ type KVServer struct {
 // https://go.dev/tour/methods/15
 func (kv *KVServer) DoOp(req any) any {
 	// Your code here
-	kv.Lock.Lock()
-	defer kv.Lock.Unlock()
 	switch args := req.(type) {
 	case rpc.GetArgs:
+		kv.Lock.Lock()
+		defer kv.Lock.Unlock()
 		var reply rpc.GetReply
 		slot, ok := kv.Store[args.Key]
 		if !ok {
@@ -52,6 +52,8 @@ func (kv *KVServer) DoOp(req any) any {
 
 		return reply
 	case rpc.PutArgs:
+		kv.Lock.Lock()
+		defer kv.Lock.Unlock()
 		var reply rpc.PutReply
 		slot, ok := kv.Store[args.Key]
 		reply.Err = rpc.OK
@@ -160,6 +162,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	labgob.Register(rsm.Op{})
 	labgob.Register(rpc.PutArgs{})
 	labgob.Register(rpc.GetArgs{})
+	labgob.Register(rpc.PutReply{})
+	labgob.Register(rpc.GetReply{})
+	labgob.Register(rpc.OK)
+	labgob.Register(rpc.ErrMaybe)
+	labgob.Register(rpc.ErrNoKey)
+	labgob.Register(rpc.ErrVersion)
+	labgob.Register(rpc.ErrWrongLeader)
 
 	kv := &KVServer{me: me}
 
