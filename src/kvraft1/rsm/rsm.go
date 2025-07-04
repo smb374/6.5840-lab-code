@@ -2,6 +2,7 @@ package rsm
 
 import (
 	"context"
+	"log"
 	"sync"
 
 	"6.5840/kvsrv1/rpc"
@@ -45,7 +46,6 @@ type RSM struct {
 	Lock         sync.Mutex
 	Ctx          context.Context
 	ReaderCancel context.CancelFunc
-	StateSize    int
 	OpCounter    int
 	OpResult     map[int]OpChan
 	Killed       bool
@@ -169,13 +169,13 @@ loop:
 				rsm.Lock.Lock()
 				opc, ok := rsm.OpResult[msg.CommandIndex]
 				term, _ := rsm.Raft().GetState()
-				rsm.StateSize++
-				if rsm.StateSize >= rsm.maxraftstate && rsm.maxraftstate != -1 {
+				if rsm.Raft().PersistBytes() >= rsm.maxraftstate && rsm.maxraftstate != -1 {
 					go func() {
 						rsm.Lock.Lock()
 						defer rsm.Lock.Unlock()
 						snapshot := rsm.sm.Snapshot()
 						rsm.Raft().Snapshot(msg.CommandIndex, snapshot)
+						log.Printf("Created Snapshot")
 					}()
 				}
 				rsm.Lock.Unlock()
@@ -190,6 +190,10 @@ loop:
 				}
 			} else if msg.SnapshotValid {
 				// TODO: Snapshot related stuff.
+				rsm.Lock.Lock()
+				rsm.sm.Restore(msg.Snapshot)
+				log.Printf("Restored Snapshot")
+				rsm.Lock.Unlock()
 			}
 		}
 	}

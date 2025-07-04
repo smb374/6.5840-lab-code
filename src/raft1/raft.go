@@ -541,17 +541,20 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 func (rf *Raft) PeerBeater(ctx context.Context, peer int, sig chan bool) {
 	go rf.ReplicateToPeer(peer)
 	ticker := time.NewTicker(BEAT_COOLDOWN)
+	isStart := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-rf.BeatSignals[peer]:
-			ticker.Reset(BEAT_COOLDOWN)
-			go rf.ReplicateToPeer(peer)
+			ticker.Reset(10 * time.Millisecond)
+			isStart = true
 		case <-ticker.C:
 			go rf.ReplicateToPeer(peer)
+			if isStart {
+				ticker.Reset(BEAT_COOLDOWN)
+			}
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -664,26 +667,22 @@ func (rf *Raft) UpdateCommitIndex() {
 }
 
 func (rf *Raft) ApplyMessages() {
-	rf.mu.Lock()
-	messagesToApply := []raftapi.ApplyMsg{}
 	for rf.LastApplied < rf.CommitIdx {
+		rf.mu.Lock()
 		rf.LastApplied++
 		aidx := rf.LastApplied - rf.PStates.LastIncludedIdx
-		messagesToApply = append(messagesToApply, raftapi.ApplyMsg{
+		msg := raftapi.ApplyMsg{
 			CommandValid: true,
 			CommandIndex: rf.LastApplied,
 			Command:      rf.PStates.Logs[aidx].Command,
-		})
-	}
-	rf.mu.Unlock()
-
-	if len(messagesToApply) != 0 {
-		for _, msg := range messagesToApply {
-			if rf.killed() {
-				return
-			}
-			rf.ApplyCh <- msg
 		}
+		if rf.killed() {
+			rf.LastApplied--
+			rf.mu.Unlock()
+			return
+		}
+		rf.mu.Unlock()
+		rf.ApplyCh <- msg
 	}
 }
 
@@ -722,7 +721,17 @@ func (rf *Raft) Kill() {
 		rf.BeatCanceler()
 	}
 
-	close(rf.ApplyCh)
+	// Active drain ApplyCh before closing it since there can be
+	// senders waiting for receiver on this channel and it'll panic
+	// on close.
+	go func() {
+		select {
+		case msg := <-rf.ApplyCh:
+			rf.ApplyCh <- msg
+		case <-time.After(5 * time.Millisecond):
+		}
+		close(rf.ApplyCh)
+	}()
 }
 
 func (rf *Raft) killed() bool {
