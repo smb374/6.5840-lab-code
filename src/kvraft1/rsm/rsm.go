@@ -1,11 +1,13 @@
 package rsm
 
 import (
+	"bytes"
 	"context"
 	"log"
 	"sync"
 
 	"6.5840/kvsrv1/rpc"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft1"
 	"6.5840/raftapi"
@@ -43,7 +45,6 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
-	Lock         sync.Mutex
 	Ctx          context.Context
 	ReaderCancel context.CancelFunc
 	OpCounter    int
@@ -54,6 +55,11 @@ type RSM struct {
 type OpChan struct {
 	ch   chan any
 	term int
+}
+
+type SnapState struct {
+	OpCounter int
+	Snapshot  []byte
 }
 
 // servers[] contains the ports of the set of
@@ -79,11 +85,16 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		sm:           sm,
 		Ctx:          context.Background(),
 		OpResult:     make(map[int]OpChan),
-		Lock:         sync.Mutex{},
 	}
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+	snapshot := persister.ReadSnapshot()
+	if len(snapshot) > 0 {
+		go rsm.Restore(snapshot)
+	}
+	rsm.mu.Lock()
+	defer rsm.mu.Unlock()
 	ctx, cancel := context.WithCancel(rsm.Ctx)
 	rsm.ReaderCancel = cancel
 	go rsm.Reader(ctx)
@@ -104,10 +115,10 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// is the argument to Submit and id is a unique id for the op.
 
 	// your code here
-	rsm.Lock.Lock()
+	rsm.mu.Lock()
 	term, isLeader := rsm.Raft().GetState()
 	if rsm.Killed || !isLeader {
-		rsm.Lock.Unlock()
+		rsm.mu.Unlock()
 		return rpc.ErrWrongLeader, nil
 	}
 
@@ -118,16 +129,16 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// A term change indicates that the node won't be a leader until next election
 	// so we can reject this submit request.
 	if !isLeader || nterm != term {
-		rsm.Lock.Unlock()
+		rsm.mu.Unlock()
 		return rpc.ErrWrongLeader, nil
 	}
 	opc := OpChan{ch: make(chan any), term: nterm}
 	rsm.OpResult[index] = opc
-	rsm.Lock.Unlock()
+	rsm.mu.Unlock()
 
 	result, ok := <-opc.ch
-	rsm.Lock.Lock()
-	defer rsm.Lock.Unlock()
+	rsm.mu.Lock()
+	defer rsm.mu.Unlock()
 	if ok {
 		close(opc.ch)
 		delete(rsm.OpResult, index)
@@ -135,6 +146,35 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	} else {
 		delete(rsm.OpResult, index)
 		return rpc.ErrWrongLeader, nil
+	}
+}
+
+func (rsm *RSM) Snapshot(index int) {
+	snapshot := rsm.sm.Snapshot()
+	state := SnapState{
+		OpCounter: rsm.OpCounter,
+		Snapshot:  snapshot,
+	}
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(state)
+
+	rsm.Raft().Snapshot(index, w.Bytes())
+}
+
+func (rsm *RSM) Restore(data []byte) {
+	rsm.mu.Lock()
+	defer rsm.mu.Unlock()
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var state SnapState
+	if d.Decode(&state) != nil {
+		log.Printf("rsm: Failed to decode snapshot")
+	} else {
+		rsm.OpCounter = state.OpCounter
+		rsm.sm.Restore(state.Snapshot)
 	}
 }
 
@@ -146,39 +186,33 @@ loop:
 			break loop
 		case msg, ok := <-rsm.applyCh:
 			if !ok {
-				rsm.Lock.Lock()
+				rsm.mu.Lock()
 				rsm.ReaderCancel()
 				rsm.Killed = true
 				for index, opc := range rsm.OpResult {
 					close(opc.ch)
 					delete(rsm.OpResult, index)
 				}
-				rsm.Lock.Unlock()
+				rsm.mu.Unlock()
 				break loop
 			}
 			if msg.IsDemotion {
-				rsm.Lock.Lock()
+				rsm.mu.Lock()
 				for index, opc := range rsm.OpResult {
 					close(opc.ch)
 					delete(rsm.OpResult, index)
 				}
-				rsm.Lock.Unlock()
+				rsm.mu.Unlock()
 			} else if msg.CommandValid {
+				rsm.mu.Lock()
 				op := msg.Command.(Op)
 				res := rsm.sm.DoOp(op.Req)
-				rsm.Lock.Lock()
 				opc, ok := rsm.OpResult[msg.CommandIndex]
 				term, _ := rsm.Raft().GetState()
 				if rsm.Raft().PersistBytes() >= rsm.maxraftstate && rsm.maxraftstate != -1 {
-					go func() {
-						rsm.Lock.Lock()
-						defer rsm.Lock.Unlock()
-						snapshot := rsm.sm.Snapshot()
-						rsm.Raft().Snapshot(msg.CommandIndex, snapshot)
-						log.Printf("Created Snapshot")
-					}()
+					rsm.Snapshot(msg.CommandIndex)
 				}
-				rsm.Lock.Unlock()
+				rsm.mu.Unlock()
 				if ok {
 					if opc.term == term {
 						// Leader need to write back DoOp result to Submit.
@@ -189,11 +223,7 @@ loop:
 					}
 				}
 			} else if msg.SnapshotValid {
-				// TODO: Snapshot related stuff.
-				rsm.Lock.Lock()
-				rsm.sm.Restore(msg.Snapshot)
-				log.Printf("Restored Snapshot")
-				rsm.Lock.Unlock()
+				rsm.Restore(msg.Snapshot)
 			}
 		}
 	}

@@ -669,17 +669,22 @@ func (rf *Raft) UpdateCommitIndex() {
 func (rf *Raft) ApplyMessages() {
 	for rf.LastApplied < rf.CommitIdx {
 		rf.mu.Lock()
+		if rf.killed() {
+			rf.mu.Unlock()
+			return
+		}
 		rf.LastApplied++
 		aidx := rf.LastApplied - rf.PStates.LastIncludedIdx
+		if aidx >= len(rf.PStates.Logs) {
+			log.Printf("%d: Weird CommitIdx problem", rf.me)
+			log.Printf("%d: LastApplied = %d, CommitIdx = %d, len(logs) = %d", rf.me, rf.LastApplied-rf.PStates.LastIncludedIdx, rf.CommitIdx-rf.PStates.LastIncludedIdx, len(rf.PStates.Logs))
+			rf.mu.Unlock()
+			return
+		}
 		msg := raftapi.ApplyMsg{
 			CommandValid: true,
 			CommandIndex: rf.LastApplied,
 			Command:      rf.PStates.Logs[aidx].Command,
-		}
-		if rf.killed() {
-			rf.LastApplied--
-			rf.mu.Unlock()
-			return
 		}
 		rf.mu.Unlock()
 		rf.ApplyCh <- msg
@@ -726,8 +731,7 @@ func (rf *Raft) Kill() {
 	// on close.
 	go func() {
 		select {
-		case msg := <-rf.ApplyCh:
-			rf.ApplyCh <- msg
+		case <-rf.ApplyCh:
 		case <-time.After(5 * time.Millisecond):
 		}
 		close(rf.ApplyCh)

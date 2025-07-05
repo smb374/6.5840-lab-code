@@ -25,7 +25,7 @@ type KVServer struct {
 
 	// Your definitions here.
 	Lock  sync.Mutex
-	Store map[string]*Slot
+	Store map[string]Slot
 }
 
 // To type-cast req to the right type, take a look at Go's type switches or type
@@ -62,9 +62,10 @@ func (kv *KVServer) DoOp(req any) any {
 			if args.Version != 0 {
 				reply.Err = rpc.ErrNoKey
 			} else {
-				slot := new(Slot)
-				slot.Value = args.Value
-				slot.Version = rpc.Tversion(1)
+				slot := Slot{
+					Value:   args.Value,
+					Version: rpc.Tversion(1),
+				}
 				kv.Store[args.Key] = slot
 			}
 		} else {
@@ -73,6 +74,7 @@ func (kv *KVServer) DoOp(req any) any {
 			} else {
 				slot.Value = args.Value
 				slot.Version += 1
+				kv.Store[args.Key] = slot
 			}
 		}
 
@@ -99,7 +101,7 @@ func (kv *KVServer) Restore(data []byte) {
 	kv.Lock.Lock()
 	defer kv.Lock.Unlock()
 
-	store := make(map[string]*Slot)
+	var store map[string]Slot
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	if d.Decode(&store) != nil {
@@ -174,6 +176,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 	// You may need initialization code here.
-	kv.Store = make(map[string]*Slot)
+	kv.Store = make(map[string]Slot)
 	return []tester.IService{kv, kv.rsm.Raft()}
 }
