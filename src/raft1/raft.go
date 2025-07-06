@@ -64,20 +64,19 @@ func (ap *Applier) Apply(msg raftapi.ApplyMsg) (killed bool) {
 		ap.Lock.Unlock()
 		return
 	}
-	ap.Lock.Unlock()
 	ap.C <- msg
+	ap.Lock.Unlock()
 
 	return
 }
 
 func (ap *Applier) Close() {
 	ap.Lock.Lock()
+	defer ap.Lock.Unlock()
 	if ap.Closed {
-		ap.Lock.Unlock()
 		return
 	}
 	ap.Closed = true
-	ap.Lock.Unlock()
 
 	// Sink draining pending messages
 sink:
@@ -90,6 +89,7 @@ sink:
 	}
 
 	close(ap.C)
+
 }
 
 // A Go object implementing a single Raft peer.
@@ -708,9 +708,9 @@ func (rf *Raft) UpdateCommitIndex() {
 }
 
 func (rf *Raft) ApplyMessages() {
-	for rf.LastApplied < rf.CommitIdx {
+	for {
 		rf.mu.Lock()
-		if rf.killed() {
+		if rf.LastApplied >= rf.CommitIdx || rf.killed() {
 			rf.mu.Unlock()
 			return
 		}
@@ -758,6 +758,8 @@ func (rf *Raft) ApplySnapshot(index, term int, snapshot []byte) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if rf.ElectionCanceler != nil {
 		rf.ElectionCanceler()
 	}
@@ -765,7 +767,7 @@ func (rf *Raft) Kill() {
 		rf.BeatCanceler()
 	}
 
-	rf.Applier.Close()
+	go rf.Applier.Close()
 }
 
 func (rf *Raft) killed() bool {

@@ -169,6 +169,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 	// You may need initialization code here.
-	kv.Store = make(map[string]Slot)
+	kv.Lock.Lock()
+	defer kv.Lock.Unlock()
+	if kv.Store == nil {
+		kv.Store = make(map[string]Slot)
+	}
 	return []tester.IService{kv, kv.rsm.Raft()}
 }

@@ -125,6 +125,7 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	op := Op{Me: rsm.me, ID: rsm.OpCounter, Req: req}
 	rsm.OpCounter++
 
+	// log.Printf("%d: Submit OP<%d>", rsm.me, op.ID)
 	index, nterm, isLeader := rsm.Raft().Start(op)
 	// A term change indicates that the node won't be a leader until next election
 	// so we can reject this submit request.
@@ -137,6 +138,7 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	rsm.mu.Unlock()
 
 	result, ok := <-opc.ch
+	// log.Printf("%d: OP<%d> finished", rsm.me, op.ID)
 	rsm.mu.Lock()
 	defer rsm.mu.Unlock()
 	if ok {
@@ -150,6 +152,8 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 }
 
 func (rsm *RSM) Snapshot(index int) {
+	rsm.mu.Lock()
+	defer rsm.mu.Unlock()
 	snapshot := rsm.sm.Snapshot()
 	state := SnapState{
 		OpCounter: rsm.OpCounter,
@@ -159,7 +163,7 @@ func (rsm *RSM) Snapshot(index int) {
 	e := labgob.NewEncoder(w)
 	e.Encode(state)
 
-	rsm.Raft().Snapshot(index, w.Bytes())
+	go rsm.Raft().Snapshot(index, w.Bytes())
 }
 
 func (rsm *RSM) Restore(data []byte) {
@@ -210,7 +214,7 @@ loop:
 				opc, ok := rsm.OpResult[msg.CommandIndex]
 				term, _ := rsm.Raft().GetState()
 				if rsm.Raft().PersistBytes() >= rsm.maxraftstate && rsm.maxraftstate != -1 {
-					rsm.Snapshot(msg.CommandIndex)
+					go rsm.Snapshot(msg.CommandIndex)
 				}
 				rsm.mu.Unlock()
 				if ok {
