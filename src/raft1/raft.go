@@ -51,6 +51,47 @@ type RaftState struct {
 	LastIncludedTerm int
 }
 
+type Applier struct {
+	C      chan raftapi.ApplyMsg
+	Closed bool
+	Lock   sync.Mutex
+}
+
+func (ap *Applier) Apply(msg raftapi.ApplyMsg) (killed bool) {
+	ap.Lock.Lock()
+	if ap.Closed {
+		killed = true
+		ap.Lock.Unlock()
+		return
+	}
+	ap.Lock.Unlock()
+	ap.C <- msg
+
+	return
+}
+
+func (ap *Applier) Close() {
+	ap.Lock.Lock()
+	if ap.Closed {
+		ap.Lock.Unlock()
+		return
+	}
+	ap.Closed = true
+	ap.Lock.Unlock()
+
+	// Sink draining pending messages
+sink:
+	for {
+		select {
+		case <-ap.C:
+		case <-time.After(time.Millisecond):
+			break sink
+		}
+	}
+
+	close(ap.C)
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -78,8 +119,8 @@ type Raft struct {
 	Processing   []bool
 	BeatCanceler context.CancelFunc
 	BeatSignals  []chan bool
-	// ApplyCh
-	ApplyCh chan raftapi.ApplyMsg
+	// Applier
+	Applier Applier
 }
 
 // return currentTerm and whether this server
@@ -675,6 +716,7 @@ func (rf *Raft) ApplyMessages() {
 		}
 		rf.LastApplied++
 		aidx := rf.LastApplied - rf.PStates.LastIncludedIdx
+		// Only appeared a few times in the history of running all the tests.
 		if aidx >= len(rf.PStates.Logs) {
 			log.Printf("%d: Weird CommitIdx problem", rf.me)
 			log.Printf("%d: LastApplied = %d, CommitIdx = %d, len(logs) = %d", rf.me, rf.LastApplied-rf.PStates.LastIncludedIdx, rf.CommitIdx-rf.PStates.LastIncludedIdx, len(rf.PStates.Logs))
@@ -687,7 +729,7 @@ func (rf *Raft) ApplyMessages() {
 			Command:      rf.PStates.Logs[aidx].Command,
 		}
 		rf.mu.Unlock()
-		rf.ApplyCh <- msg
+		rf.Applier.Apply(msg)
 	}
 }
 
@@ -701,10 +743,7 @@ func (rf *Raft) ApplySnapshot(index, term int, snapshot []byte) {
 		Snapshot:      snapshot,
 	}
 
-	if rf.killed() {
-		return
-	}
-	rf.ApplyCh <- msg
+	rf.Applier.Apply(msg)
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -726,16 +765,7 @@ func (rf *Raft) Kill() {
 		rf.BeatCanceler()
 	}
 
-	// Active drain ApplyCh before closing it since there can be
-	// senders waiting for receiver on this channel and it'll panic
-	// on close.
-	go func() {
-		select {
-		case <-rf.ApplyCh:
-		case <-time.After(5 * time.Millisecond):
-		}
-		close(rf.ApplyCh)
-	}()
+	rf.Applier.Close()
 }
 
 func (rf *Raft) killed() bool {
@@ -765,7 +795,7 @@ func (rf *Raft) InitFollower(new_term int) {
 		if rf.killed() {
 			return
 		}
-		rf.ApplyCh <- raftapi.ApplyMsg{IsDemotion: true, DemotedTerm: new_term}
+		rf.Applier.Apply(raftapi.ApplyMsg{IsDemotion: true, DemotedTerm: new_term})
 	}
 }
 
@@ -931,7 +961,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.CommitIdx = 0
 	rf.LastApplied = 0
 	rf.LastHeartBeat = time.Time{}
-	rf.ApplyCh = applyCh
+	rf.Applier = Applier{C: applyCh}
 	rf.BeatSignals = make([]chan bool, len(rf.peers))
 
 	for p := range rf.peers {
