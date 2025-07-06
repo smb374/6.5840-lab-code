@@ -52,6 +52,7 @@ type RaftState struct {
 }
 
 type Applier struct {
+	Me     int
 	C      chan raftapi.ApplyMsg
 	Closed bool
 	Lock   sync.Mutex
@@ -409,8 +410,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if idx < len(rf.PStates.Logs) {
 			// Overwrite inconsistent entries in current node
 			if rf.PStates.Logs[idx].Term != e.Term {
-				rf.PStates.Logs = rf.PStates.Logs[:idx]
-				rf.PStates.Logs = append(rf.PStates.Logs, args.Entries[i:]...)
+				newLogs := rf.PStates.Logs[:idx]
+				newLogs = append(newLogs, args.Entries[i:]...)
+				rf.PStates.Logs = newLogs
 				rf.persist()
 				break
 			}
@@ -708,28 +710,30 @@ func (rf *Raft) UpdateCommitIndex() {
 }
 
 func (rf *Raft) ApplyMessages() {
-	for {
-		rf.mu.Lock()
-		if rf.LastApplied >= rf.CommitIdx || rf.killed() {
-			rf.mu.Unlock()
-			return
-		}
+	messages := []raftapi.ApplyMsg{}
+	rf.mu.Lock()
+	oldLastApplied := rf.LastApplied
+	for rf.LastApplied < rf.CommitIdx {
 		rf.LastApplied++
 		aidx := rf.LastApplied - rf.PStates.LastIncludedIdx
-		// Only appeared a few times in the history of running all the tests.
-		if aidx >= len(rf.PStates.Logs) {
-			log.Printf("%d: Weird CommitIdx problem", rf.me)
-			log.Printf("%d: LastApplied = %d, CommitIdx = %d, len(logs) = %d", rf.me, rf.LastApplied-rf.PStates.LastIncludedIdx, rf.CommitIdx-rf.PStates.LastIncludedIdx, len(rf.PStates.Logs))
-			rf.mu.Unlock()
-			return
-		}
 		msg := raftapi.ApplyMsg{
 			CommandValid: true,
 			CommandIndex: rf.LastApplied,
 			Command:      rf.PStates.Logs[aidx].Command,
 		}
-		rf.mu.Unlock()
-		rf.Applier.Apply(msg)
+		messages = append(messages, msg)
+	}
+	rf.mu.Unlock()
+
+	for _, msg := range messages {
+		killed := rf.Applier.Apply(msg)
+		if killed {
+			rf.mu.Lock()
+			rf.LastApplied = oldLastApplied
+			rf.mu.Unlock()
+			return
+		}
+		oldLastApplied++
 	}
 }
 
@@ -963,7 +967,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.CommitIdx = 0
 	rf.LastApplied = 0
 	rf.LastHeartBeat = time.Time{}
-	rf.Applier = Applier{C: applyCh}
+	rf.Applier = Applier{Me: me, C: applyCh}
 	rf.BeatSignals = make([]chan bool, len(rf.peers))
 
 	for p := range rf.peers {
